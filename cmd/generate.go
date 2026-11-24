@@ -1008,7 +1008,7 @@ func main(cmd *cobra.Command, args []string) error {
 	}
 
 	if onlyChangedFiles {
-		os.Stderr.WriteString(buildScopedReport(scoped, yamlString, len(config.Projects), time.Since(startTime)))
+		os.Stderr.WriteString(buildScopedReport(scoped, &config, time.Since(startTime)))
 		os.Stderr.WriteString("\n")
 	}
 

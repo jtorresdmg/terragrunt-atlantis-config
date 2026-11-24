@@ -45,7 +45,7 @@ func color(text, code string) string {
 
 // buildScopedReport renders the human-readable PR-scoped generation summary
 // followed by the generated atlantis.yaml (syntax-highlighted).
-func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int, elapsed time.Duration) string {
+func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, elapsed time.Duration) string {
 	var b strings.Builder
 
 	b.WriteString(color("Scoped generation: ", ansiBold))
@@ -135,9 +135,9 @@ func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int, 
 
 	// ── Generated YAML ──
 	b.WriteString("\n")
-	b.WriteString(color("── generated atlantis.yaml ("+itoa(projectCount)+" projects) ──", ansiBold))
+	b.WriteString(color("── generated atlantis.yaml ("+itoa(len(config.Projects))+" projects) ──", ansiBold))
 	b.WriteString("\n\n")
-	b.WriteString(highlightYaml(yamlString))
+	b.WriteString(highlightYaml(renderReportYaml(config)))
 
 	// ── Elapsed ──
 	b.WriteString("\n")
@@ -156,6 +156,59 @@ func changedFileKind(path string) string {
 		return "shared"
 	}
 	return ""
+}
+
+// renderReportYaml builds the generated atlantis.yaml with a stable, readable
+// field order for the report only (the file keeps the original marshaling).
+func renderReportYaml(config *AtlantisConfig) string {
+	var b strings.Builder
+	b.WriteString("version: " + itoa(config.Version) + "\n")
+	b.WriteString("automerge: " + boolToStr(config.AutoMerge) + "\n")
+	b.WriteString("parallel_plan: " + boolToStr(config.ParallelPlan) + "\n")
+	b.WriteString("parallel_apply: " + boolToStr(config.ParallelApply) + "\n")
+	b.WriteString("projects:\n")
+	for _, p := range config.Projects {
+		b.WriteString("- name: " + p.Name + "\n")
+		b.WriteString("  dir: " + p.Dir + "\n")
+		if p.Workflow != "" {
+			b.WriteString("  workflow: " + p.Workflow + "\n")
+		}
+		if p.Workspace != "" {
+			b.WriteString("  workspace: " + p.Workspace + "\n")
+		}
+		b.WriteString("  autoplan:\n")
+		b.WriteString("    enabled: " + boolToStr(p.Autoplan.Enabled) + "\n")
+		b.WriteString("    when_modified:\n")
+		for _, wm := range p.Autoplan.WhenModified {
+			b.WriteString("    - '" + wm + "'\n")
+		}
+		if p.TerraformVersion != "" {
+			b.WriteString("  terraform_version: " + p.TerraformVersion + "\n")
+		}
+		if p.ApplyRequirements != nil {
+			b.WriteString("  apply_requirements:\n")
+			for _, req := range *p.ApplyRequirements {
+				b.WriteString("  - " + req + "\n")
+			}
+		}
+		if len(p.DependsOn) > 0 {
+			b.WriteString("  depends_on:\n")
+			for _, dep := range p.DependsOn {
+				b.WriteString("  - " + dep + "\n")
+			}
+		}
+		if p.ExecutionOrderGroup != nil {
+			b.WriteString("  execution_order_group: " + itoa(*p.ExecutionOrderGroup) + "\n")
+		}
+	}
+	return b.String()
+}
+
+func boolToStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }
 
 // highlightYaml applies lightweight syntax highlighting to the generated YAML.
