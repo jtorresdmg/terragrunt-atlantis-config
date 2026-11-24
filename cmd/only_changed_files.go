@@ -2,13 +2,13 @@ package cmd
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
-
-	log "github.com/sirupsen/logrus"
 )
 
 const terragruntUnitFile = "terragrunt.hcl"
@@ -152,76 +152,299 @@ func matchesWhenModified(projectDir string, whenModified []string, repoRelativeF
 	return false
 }
 
-// dependencyDirs returns the project dirs this project depends on, derived
-// from when_modified entries that resolve to another project's dir. This is
-// the same derivation the `depends_on` computation uses.
-func dependencyDirs(projectDir string, whenModified []string, projectDirs map[string]struct{}) []string {
-	deps := []string{}
-	for _, pattern := range whenModified {
-		pattern = filepath.ToSlash(pattern)
-		if pattern == "" || strings.HasPrefix(pattern, "!") {
-			continue
-		}
-		joined := filepath.ToSlash(filepath.Clean(filepath.Join(projectDir, pattern)))
-		depPath := filepath.ToSlash(filepath.Dir(joined))
-		if depPath == projectDir {
-			continue
-		}
-		if _, ok := projectDirs[depPath]; ok {
-			deps = append(deps, depPath)
-		}
-	}
-	return uniqueStrings(deps)
+// ---------------------------------------------------------------------------
+// Lightweight Terragrunt parsing (regex-based, no full HCL evaluation).
+// ---------------------------------------------------------------------------
+
+var (
+	dependencyBlockRe = regexp.MustCompile(`dependency\s+"[^"]+"\s*\{[^}]*\}`)
+	configPathRe      = regexp.MustCompile(`config_path\s*=\s*"([^"]+)"`)
+	moduleSourceRe    = regexp.MustCompile(`source\s*=\s*"\$\{get_repo_root\(\)\}/([^"]+)"`)
+	fileExprRe        = regexp.MustCompile(`file\("([^"]+)"\)`)
+	findInParentRe    = regexp.MustCompile(`find_in_parent_folders\("([^"]+)"\)`)
+)
+
+// skipDirNames are directory names excluded from the Terragrunt unit walk.
+var skipDirNames = map[string]bool{
+	".git":              true,
+	".terragrunt-cache": true,
+	".terraform":        true,
+	"node_modules":      true,
 }
 
-// expandClosure returns the affected dirs plus their transitive forward
-// (dependencies) and reverse (dependents) closure.
-func expandClosure(projects []AtlantisProject, affected map[string]struct{}) map[string]struct{} {
-	projectDirs := make(map[string]struct{}, len(projects))
-	for i := range projects {
-		projectDirs[projects[i].Dir] = struct{}{}
+// stripHclLineComments removes HCL `#` line comments (outside double quotes).
+func stripHclLineComments(content string) string {
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		inString := false
+		for i := 0; i < len(line); i++ {
+			c := line[i]
+			if c == '"' && (i == 0 || line[i-1] != '\\') {
+				inString = !inString
+			}
+			if !inString && c == '#' {
+				line = line[:i]
+				break
+			}
+		}
+		out = append(out, line)
 	}
+	return strings.Join(out, "\n")
+}
 
-	forward := make(map[string][]string, len(projects))
-	reverse := make(map[string][]string, len(projects))
-	for i := range projects {
-		deps := dependencyDirs(projects[i].Dir, projects[i].Autoplan.WhenModified, projectDirs)
-		forward[projects[i].Dir] = deps
-		for _, dep := range deps {
-			reverse[dep] = append(reverse[dep], projects[i].Dir)
+// readUnitContent returns the terragrunt.hcl content of a unit dir.
+func readUnitContent(repoRoot, unitDir string) (string, bool) {
+	root, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return "", false
+	}
+	path := filepath.Join(filepath.Clean(root), filepath.FromSlash(unitDir), terragruntUnitFile)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+// repoRel returns a posix repo-relative path from an absolute path ("" if outside).
+func repoRel(repoRoot, abs string) string {
+	rel, err := filepath.Rel(filepath.Clean(repoRoot), filepath.Clean(abs))
+	if err != nil {
+		return ""
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == "." || strings.HasPrefix(rel, "../") {
+		return ""
+	}
+	return rel
+}
+
+// iterTerragruntUnitDirs lists all repo-relative Terragrunt unit dirs.
+func iterTerragruntUnitDirs(repoRoot string) []string {
+	root, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return nil
+	}
+	root = filepath.Clean(root)
+	dirs := []string{}
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if skipDirNames[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() == terragruntUnitFile {
+			if rel := repoRel(root, filepath.Dir(path)); rel != "" {
+				dirs = append(dirs, rel)
+			}
+		}
+		return nil
+	})
+	return dirs
+}
+
+// dependencyTargetDirs returns the repo-relative unit dirs referenced by
+// `dependency { config_path }` blocks in a unit (in-repo only).
+func dependencyTargetDirs(repoRoot, unitDir string) []string {
+	content, ok := readUnitContent(repoRoot, unitDir)
+	if !ok {
+		return nil
+	}
+	stripped := stripHclLineComments(content)
+	targets := map[string]struct{}{}
+	for _, block := range dependencyBlockRe.FindAllString(stripped, -1) {
+		m := configPathRe.FindStringSubmatch(block)
+		if m == nil {
+			continue
+		}
+		relCfg := m[1]
+		root, _ := filepath.Abs(repoRoot)
+		resolved := filepath.Clean(filepath.Join(filepath.Clean(root), filepath.FromSlash(unitDir), filepath.FromSlash(relCfg)))
+		rel := repoRel(root, resolved)
+		if rel == "" {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(resolved, terragruntUnitFile)); err == nil && !info.IsDir() {
+			targets[rel] = struct{}{}
 		}
 	}
+	return sortedKeys(targets)
+}
 
-	closure := make(map[string]struct{}, len(affected))
-	queue := make([]string, 0, len(affected))
-	for dir := range affected {
-		closure[dir] = struct{}{}
-		queue = append(queue, dir)
-	}
+// collectDependencyClosure returns the transitive forward dependency closure.
+func collectDependencyClosure(repoRoot string, entryDirs []string) map[string]struct{} {
+	seen := map[string]struct{}{}
+	queue := append([]string{}, entryDirs...)
 	for len(queue) > 0 {
 		dir := queue[0]
 		queue = queue[1:]
-		for _, dep := range forward[dir] {
-			if _, ok := closure[dep]; !ok {
-				closure[dep] = struct{}{}
-				queue = append(queue, dep)
-			}
+		if dir == "" {
+			continue
 		}
-		for _, dep := range reverse[dir] {
-			if _, ok := closure[dep]; !ok {
-				closure[dep] = struct{}{}
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		for _, dep := range dependencyTargetDirs(repoRoot, dir) {
+			if _, ok := seen[dep]; !ok {
 				queue = append(queue, dep)
 			}
 		}
 	}
-	return closure
+	return seen
 }
 
-// scopeProjects filters config.Projects to those affected by the PR's changed
-// files plus their dependency closure.
-func scopeProjects(config *AtlantisConfig) (*AtlantisConfig, error) {
+// collectReverseDependents returns units that declare a dependency toward any
+// of the target dirs (scanning all units).
+func collectReverseDependents(repoRoot string, targetDirs map[string]struct{}) map[string]struct{} {
+	consumers := map[string]struct{}{}
+	for _, unitDir := range iterTerragruntUnitDirs(repoRoot) {
+		for _, dep := range dependencyTargetDirs(repoRoot, unitDir) {
+			if _, ok := targetDirs[dep]; ok {
+				consumers[unitDir] = struct{}{}
+				break
+			}
+		}
+	}
+	return consumers
+}
+
+// inferWhenModified returns a lightweight approximation of a unit's
+// autoplan.when_modified, used only to discover downstream consumers.
+func inferWhenModified(repoRoot, unitDir string) []string {
+	content, ok := readUnitContent(repoRoot, unitDir)
+	if !ok {
+		return []string{"*.hcl", "*.tf*"}
+	}
+	stripped := stripHclLineComments(content)
+	root, _ := filepath.Abs(repoRoot)
+	root = filepath.Clean(root)
+	unitAbs := filepath.Join(root, filepath.FromSlash(unitDir))
+
+	patterns := []string{"*.hcl", "*.tf*"}
+
+	// file("...") expressions resolved relative to the unit dir.
+	for _, m := range fileExprRe.FindAllStringSubmatch(stripped, -1) {
+		expr := m[1]
+		token := strings.TrimSpace(expr)
+		prefix := "${get_terragrunt_dir()}/"
+		if strings.HasPrefix(token, prefix) {
+			token = token[len(prefix):]
+		}
+		if token == "" || strings.Contains(token, "..") {
+			continue
+		}
+		candidate := filepath.Join(unitAbs, filepath.FromSlash(token))
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			patterns = append(patterns, filepath.ToSlash(token))
+		}
+	}
+
+	// find_in_parent_folders("...") resolved via parents.
+	for _, m := range findInParentRe.FindAllStringSubmatch(stripped, -1) {
+		filename := m[1]
+		if filename == "" || strings.Contains(filename, "/") {
+			continue
+		}
+		current := unitAbs
+		for {
+			if repoRel(root, current) == "" && current != root {
+				break
+			}
+			candidate := filepath.Join(current, filename)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				rel, rerr := filepath.Rel(unitAbs, candidate)
+				if rerr == nil {
+					patterns = append(patterns, filepath.ToSlash(rel))
+				}
+				break
+			}
+			if current == root {
+				break
+			}
+			current = filepath.Dir(current)
+		}
+	}
+
+	// terraform source "${get_repo_root()}/..." -> module dir glob.
+	for _, m := range moduleSourceRe.FindAllStringSubmatch(stripped, -1) {
+		moduleRel := strings.Trim(m[1], "/")
+		moduleAbs := filepath.Join(root, filepath.FromSlash(moduleRel))
+		if info, err := os.Stat(moduleAbs); err == nil && info.IsDir() {
+			rel := filepath.ToSlash(mustRel(unitAbs, moduleAbs))
+			patterns = append(patterns, rel+"/*.tf*")
+		}
+	}
+
+	// dependency { config_path } -> upstream terragrunt.hcl + its module globs.
+	for _, depDir := range dependencyTargetDirs(repoRoot, unitDir) {
+		depAbs := filepath.Join(root, filepath.FromSlash(depDir))
+		relDir := filepath.ToSlash(mustRel(unitAbs, depAbs))
+		if relDir != "." && relDir != "" {
+			patterns = append(patterns, relDir+"/terragrunt.hcl")
+		}
+		if depContent, ok := readUnitContent(repoRoot, depDir); ok {
+			for _, m := range moduleSourceRe.FindAllStringSubmatch(stripHclLineComments(depContent), -1) {
+				depModuleRel := strings.Trim(m[1], "/")
+				depModuleAbs := filepath.Join(root, filepath.FromSlash(depModuleRel))
+				if info, err := os.Stat(depModuleAbs); err == nil && info.IsDir() {
+					rel := filepath.ToSlash(mustRel(unitAbs, depModuleAbs))
+					patterns = append(patterns, rel+"/*.tf*")
+				}
+			}
+		}
+	}
+
+	return uniqueStrings(patterns)
+}
+
+// discoverUnitsByWhenModified returns units whose inferred when_modified
+// matches at least one changed file (downstream consumers).
+func discoverUnitsByWhenModified(repoRoot string, changedFiles []string) map[string]struct{} {
+	matched := map[string]struct{}{}
+	if len(changedFiles) == 0 {
+		return matched
+	}
+	changed := make([]string, 0, len(changedFiles))
+	for _, f := range changedFiles {
+		f = filepath.ToSlash(strings.TrimSpace(f))
+		f = strings.TrimPrefix(f, "/")
+		if f != "" {
+			changed = append(changed, f)
+		}
+	}
+	if len(changed) == 0 {
+		return matched
+	}
+	for _, unitDir := range iterTerragruntUnitDirs(repoRoot) {
+		patterns := inferWhenModified(repoRoot, unitDir)
+		for _, repoFile := range changed {
+			if matchesWhenModified(unitDir, patterns, repoFile) {
+				matched[unitDir] = struct{}{}
+				break
+			}
+		}
+	}
+	return matched
+}
+
+// scopedDiscovery holds the result of the discover + expand phases.
+type scopedDiscovery struct {
+	dirs         map[string]struct{}
+	changedFiles int
+	direct       int
+	consumers    int
+}
+
+// discoverAffectedUnitDirs computes the units to generate for the PR.
+func discoverAffectedUnitDirs(repoRoot string) (*scopedDiscovery, error) {
 	ref := resolveBaseRef()
-	entries, err := gitDiffNameStatus(gitRoot, ref)
+	entries, err := gitDiffNameStatus(repoRoot, ref)
 	if err != nil {
 		return nil, fmt.Errorf("--only-changed-files: cannot diff %q...HEAD: %w", ref, err)
 	}
@@ -231,67 +454,72 @@ func scopeProjects(config *AtlantisConfig) (*AtlantisConfig, error) {
 	for _, entry := range entries {
 		switch {
 		case strings.HasPrefix(entry.status, "R"):
-			if old := findUnitDirForFile(gitRoot, entry.oldPath); old != "" {
-				affected[old] = struct{}{}
+			if d := findUnitDirForFile(repoRoot, entry.oldPath); d != "" {
+				affected[d] = struct{}{}
 			}
-			if newDir := findUnitDirForFile(gitRoot, entry.newPath); newDir != "" {
-				affected[newDir] = struct{}{}
+			if d := findUnitDirForFile(repoRoot, entry.newPath); d != "" {
+				affected[d] = struct{}{}
 			}
 		case entry.status == "D":
-			if dir := findUnitDirForFile(gitRoot, entry.newPath); dir != "" {
-				affected[dir] = struct{}{}
+			if d := findUnitDirForFile(repoRoot, entry.newPath); d != "" {
+				affected[d] = struct{}{}
 			}
 		default:
 			changedFiles = append(changedFiles, entry.newPath)
-			if dir := findUnitDirForFile(gitRoot, entry.newPath); dir != "" {
-				affected[dir] = struct{}{}
+			if d := findUnitDirForFile(repoRoot, entry.newPath); d != "" {
+				affected[d] = struct{}{}
 			}
 		}
 	}
 
-	// Consumer discovery: units whose when_modified matches a changed file.
-	for i := range config.Projects {
-		for _, file := range changedFiles {
-			if matchesWhenModified(config.Projects[i].Dir, config.Projects[i].Autoplan.WhenModified, file) {
-				affected[config.Projects[i].Dir] = struct{}{}
-				break
-			}
-		}
+	directCount := len(affected)
+	for d := range discoverUnitsByWhenModified(repoRoot, changedFiles) {
+		affected[d] = struct{}{}
+	}
+	consumerCount := len(affected) - directCount
+	if consumerCount < 0 {
+		consumerCount = 0
 	}
 
-	closure := expandClosure(config.Projects, affected)
-
-	filtered := AtlantisConfig{
-		Version:       config.Version,
-		AutoMerge:     config.AutoMerge,
-		ParallelPlan:  config.ParallelPlan,
-		ParallelApply: config.ParallelApply,
-		Workflows:     config.Workflows,
-	}
-	includedNames := map[string]struct{}{}
-	for i := range config.Projects {
-		if _, ok := closure[config.Projects[i].Dir]; ok {
-			filtered.Projects = append(filtered.Projects, config.Projects[i])
-			if config.Projects[i].Name != "" {
-				includedNames[config.Projects[i].Name] = struct{}{}
-			}
-		}
+	closure := collectDependencyClosure(repoRoot, sortedKeys(affected))
+	for d := range collectReverseDependents(repoRoot, closure) {
+		closure[d] = struct{}{}
 	}
 
-	// Prune depends_on edges pointing to projects outside the scoped set.
-	for i := range filtered.Projects {
-		pruned := make([]string, 0, len(filtered.Projects[i].DependsOn))
-		for _, name := range filtered.Projects[i].DependsOn {
-			if _, ok := includedNames[name]; ok {
-				pruned = append(pruned, name)
-			}
-		}
-		filtered.Projects[i].DependsOn = pruned
-	}
+	return &scopedDiscovery{
+		dirs:         closure,
+		changedFiles: len(changedFiles),
+		direct:       directCount,
+		consumers:    consumerCount,
+	}, nil
+}
 
-	log.Infof(
-		"Scoped config to %d of %d projects (base ref %q, %d changed files)",
-		len(filtered.Projects), len(config.Projects), ref, len(changedFiles),
-	)
-	return &filtered, nil
+// isAffectedUnitDir reports whether an absolute terragrunt.hcl path belongs to
+// the scoped set of unit dirs.
+func (d *scopedDiscovery) contains(repoRoot, absTerragruntPath string) bool {
+	rel := repoRel(repoRoot, filepath.Dir(absTerragruntPath))
+	if rel == "" {
+		return false
+	}
+	_, ok := d.dirs[rel]
+	return ok
+}
+
+// sortedKeys returns the sorted keys of a set.
+func sortedKeys(set map[string]struct{}) []string {
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// mustRel returns the relative path from base to target, or target on error.
+func mustRel(base, target string) string {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return target
+	}
+	return rel
 }

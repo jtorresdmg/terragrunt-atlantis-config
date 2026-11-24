@@ -791,6 +791,15 @@ func main(cmd *cobra.Command, args []string) error {
 		config.Projects = oldConfig.Projects
 	}
 
+	var scoped *scopedDiscovery
+	if onlyChangedFiles {
+		scoped, err = discoverAffectedUnitDirs(gitRoot)
+		if err != nil {
+			return err
+		}
+		log.Infof("Scoped generation: %d changed files -> %d units in scope", scoped.changedFiles, len(scoped.dirs))
+	}
+
 	lock := sync.Mutex{}
 	ctx := context.Background()
 	errGroup, _ := errgroup.WithContext(ctx)
@@ -806,6 +815,10 @@ func main(cmd *cobra.Command, args []string) error {
 			// Concurrently looking all dependencies
 			for _, terragruntPath := range terragruntFiles {
 				terragruntPath := terragruntPath // https://golang.org/doc/faq#closures_and_goroutines
+
+				if onlyChangedFiles && !scoped.contains(gitRoot, terragruntPath) {
+					continue
+				}
 
 				// don't create atlantis projects already covered by project hcl file projects
 				skipProject := false
@@ -972,16 +985,6 @@ func main(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// When generating a PR-scoped config, keep only the projects affected by
-	// the changed files and their dependency closure.
-	if onlyChangedFiles {
-		scoped, scopeErr := scopeProjects(&config)
-		if scopeErr != nil {
-			return scopeErr
-		}
-		config = *scoped
-	}
-
 	// Convert config to YAML string
 	yamlBytes, err := yaml.Marshal(&config)
 	if err != nil {
@@ -1000,6 +1003,10 @@ func main(cmd *cobra.Command, args []string) error {
 		os.WriteFile(outputPath, []byte(yamlString), 0644)
 	} else {
 		log.Println(yamlString)
+	}
+
+	if onlyChangedFiles {
+		log.Printf("Generated dynamic atlantis.yaml (%d projects):\n%s", len(config.Projects), yamlString)
 	}
 
 	return nil

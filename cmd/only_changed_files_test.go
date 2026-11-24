@@ -56,49 +56,14 @@ func TestMatchesWhenModified(t *testing.T) {
 		"../../../_modules/github/custom-properties/*.tf*",
 	}
 
-	// A file in the project dir matches the bare globs.
 	assert.True(t, matchesWhenModified(projectDir, patterns, "github/ib-data-platform/custom-properties/main.tf"))
-	// A module file matches the resolved module glob.
 	assert.True(t, matchesWhenModified(projectDir, patterns, "_modules/github/custom-properties/main.tf"))
-	// An unrelated file does not match.
 	assert.False(t, matchesWhenModified(projectDir, patterns, "github/ib-data-platform/other/main.tf"))
 }
 
 func TestMatchesWhenModifiedNegation(t *testing.T) {
 	patterns := []string{"*.hcl", "!ignored.hcl"}
 	assert.False(t, matchesWhenModified("app", patterns, "ignored.hcl"))
-}
-
-func TestDependencyDirs(t *testing.T) {
-	projectDirs := map[string]struct{}{
-		"github/ib-data-platform/custom-properties":          {},
-		"github/ib-data-platform/rulesets/corporate/finance": {},
-	}
-
-	deps := dependencyDirs(
-		"github/ib-data-platform/rulesets/corporate/finance",
-		[]string{
-			"*.hcl",
-			"../../../custom-properties/terragrunt.hcl",
-			"../../../../../_modules/github/custom-properties/*.tf*",
-		},
-		projectDirs,
-	)
-	assert.Equal(t, []string{"github/ib-data-platform/custom-properties"}, deps)
-}
-
-func TestExpandClosure(t *testing.T) {
-	projects := []AtlantisProject{
-		{Dir: "custom-properties", Autoplan: AutoplanConfig{WhenModified: []string{"*.hcl", "*.tf*"}}},
-		{Dir: "rulesets/finance", Autoplan: AutoplanConfig{WhenModified: []string{"*.hcl", "../../custom-properties/terragrunt.hcl"}}},
-		{Dir: "unrelated", Autoplan: AutoplanConfig{WhenModified: []string{"*.hcl"}}},
-	}
-
-	closure := expandClosure(projects, map[string]struct{}{"custom-properties": {}})
-
-	assert.Contains(t, closure, "custom-properties")
-	assert.Contains(t, closure, "rulesets/finance")
-	assert.NotContains(t, closure, "unrelated")
 }
 
 func TestFindUnitDirForFile(t *testing.T) {
@@ -124,6 +89,75 @@ func TestFindUnitDirForFile(t *testing.T) {
 		"",
 		findUnitDirForFile(root, "_modules/github/custom-properties/main.tf"),
 	)
+}
+
+func writeUnit(t *testing.T, root, unitDir, content string) {
+	t.Helper()
+	dir := filepath.Join(root, filepath.FromSlash(unitDir))
+	requireNoErr(t, os.MkdirAll(dir, 0o755))
+	requireNoErr(t, os.WriteFile(filepath.Join(dir, "terragrunt.hcl"), []byte(content), 0o644))
+}
+
+func TestDependencyTargetDirs(t *testing.T) {
+	root := t.TempDir()
+	writeUnit(t, root, "dep", `terraform { source = "${get_repo_root()}/_modules/foo" }`)
+	writeUnit(t, root, "depender", `
+terraform { source = "${get_repo_root()}/_modules/foo" }
+dependency "some_dep" { config_path = "../dep" }
+`)
+
+	assert.Equal(t, []string{"dep"}, dependencyTargetDirs(root, "depender"))
+}
+
+func TestCollectDependencyClosure(t *testing.T) {
+	root := t.TempDir()
+	writeUnit(t, root, "a", `terraform { source = "${get_repo_root()}/_modules/foo" }`)
+	writeUnit(t, root, "b", `
+terraform { source = "${get_repo_root()}/_modules/foo" }
+dependency "x" { config_path = "../a" }
+`)
+	writeUnit(t, root, "c", `
+terraform { source = "${get_repo_root()}/_modules/foo" }
+dependency "x" { config_path = "../b" }
+`)
+
+	closure := collectDependencyClosure(root, []string{"c"})
+	assert.Contains(t, closure, "c")
+	assert.Contains(t, closure, "b")
+	assert.Contains(t, closure, "a")
+}
+
+func TestCollectReverseDependents(t *testing.T) {
+	root := t.TempDir()
+	writeUnit(t, root, "a", `terraform { source = "${get_repo_root()}/_modules/foo" }`)
+	writeUnit(t, root, "b", `
+terraform { source = "${get_repo_root()}/_modules/foo" }
+dependency "x" { config_path = "../a" }
+`)
+
+	consumers := collectReverseDependents(root, map[string]struct{}{"a": {}})
+	assert.Contains(t, consumers, "b")
+	assert.NotContains(t, consumers, "a")
+}
+
+func TestInferWhenModifiedModuleSource(t *testing.T) {
+	root := t.TempDir()
+	requireNoErr(t, os.MkdirAll(filepath.Join(root, "_modules", "foo"), 0o755))
+	requireNoErr(t, os.WriteFile(filepath.Join(root, "_modules", "foo", "main.tf"), []byte(""), 0o644))
+	writeUnit(t, root, "unit", `terraform { source = "${get_repo_root()}/_modules/foo" }`)
+
+	patterns := inferWhenModified(root, "unit")
+	assert.Contains(t, patterns, "../_modules/foo/*.tf*")
+}
+
+func TestDiscoverUnitsByWhenModified(t *testing.T) {
+	root := t.TempDir()
+	requireNoErr(t, os.MkdirAll(filepath.Join(root, "_modules", "foo"), 0o755))
+	requireNoErr(t, os.WriteFile(filepath.Join(root, "_modules", "foo", "main.tf"), []byte(""), 0o644))
+	writeUnit(t, root, "unit", `terraform { source = "${get_repo_root()}/_modules/foo" }`)
+
+	consumers := discoverUnitsByWhenModified(root, []string{"_modules/foo/main.tf"})
+	assert.Contains(t, consumers, "unit")
 }
 
 func requireNoErr(t *testing.T, err error) {
