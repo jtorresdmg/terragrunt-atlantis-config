@@ -972,6 +972,16 @@ func main(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// When generating a PR-scoped config, keep only the projects affected by
+	// the changed files and their dependency closure.
+	if onlyChangedFiles {
+		scoped, scopeErr := scopeProjects(&config)
+		if scopeErr != nil {
+			return scopeErr
+		}
+		config = *scoped
+	}
+
 	// Convert config to YAML string
 	yamlBytes, err := yaml.Marshal(&config)
 	if err != nil {
@@ -1021,6 +1031,8 @@ var createHclProjectExternalChilds bool
 var useProjectMarkers bool
 var executionOrderGroups bool
 var dependsOn bool
+var onlyChangedFiles bool
+var baseRef string
 
 // generateCmd represents the generate command
 var generateCmd = &cobra.Command{
@@ -1071,6 +1083,8 @@ func init() {
 	generateCmd.PersistentFlags().BoolVar(&useProjectMarkers, "use-project-markers", false, "Creates Atlantis projects only for project hcl files with locals: atlantis_project = true")
 	generateCmd.PersistentFlags().BoolVar(&executionOrderGroups, "execution-order-groups", false, "Computes execution_order_groups for projects")
 	generateCmd.PersistentFlags().BoolVar(&dependsOn, "depends-on", false, "Computes depends_on for projects. Requires --create-project-name.")
+	generateCmd.PersistentFlags().BoolVar(&onlyChangedFiles, "only-changed-files", false, "Generate only the projects affected by files changed in the current PR (requires a git repository).")
+	generateCmd.PersistentFlags().StringVar(&baseRef, "base-ref", "", "Git ref used to detect changed files with --only-changed-files (default origin/$BASE_BRANCH_NAME or origin/main).")
 }
 
 // Runs a set of arguments, returning the output

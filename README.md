@@ -133,6 +133,9 @@ One way to customize the behavior of this module is through CLI flag values pass
 | `--num-executors`            | Number of executors used for parallel generation of projects. Default is 15                                                                                                     | 15                |
 | `--execution-order-groups`   | Computes execution_order_group for projects                                                                                                                                     | false             |
 | `--depends-on`               | Computes depends_on for projects. Project names are required.                                                                                                                   | false             |
+| `--when-modified-exclude-paths` | Comma-separated repo-relative globs omitted from each project's autoplan `when_modified` (merged with `locals.atlantis_when_modified_exclude`). See [PR-scoped config](#pr-scoped-config) | []                |
+| `--only-changed-files`       | Generate only the projects affected by files changed in the current PR (requires a git repository). See [PR-scoped config](#pr-scoped-config)                                   | false             |
+| `--base-ref`                 | Git ref used to detect changed files with `--only-changed-files` (default `origin/$BASE_BRANCH_NAME` or `origin/main`)                                                          | ""                |
 
 ## Project generation
 
@@ -144,6 +147,40 @@ These flags offer additional options to generate Atlantis projects based on HCL 
 | `--use-project-markers`      | If enabled, project hcl files must include `locals { atlantis_project = true }` for project creation.  | false      |  bool |
 | `--create-hcl-project-childs`        | Creates Atlantis projects for terragrunt child modules below the directories containing the HCL files defined in --project-hcl-files  | false       | bool |
 | `--create-hcl-project-external-childs`    | Creates Atlantis projects for terragrunt child modules outside the directories containing the HCL files defined in --project-hcl-files  | true          | bool |
+
+## PR-scoped config
+
+By default, this tool generates the **full catalog**: every Terragrunt unit becomes an Atlantis project. For monorepos with thousands of units this produces a very large `atlantis.yaml`.
+
+### Generate only the changed projects
+
+`--only-changed-files` emits only the projects affected by the current pull request. It detects the changed files with `git diff` against `--base-ref` (default `origin/$BASE_BRANCH_NAME` or `origin/main`), then keeps:
+
+1. **Direct** — units that own a changed file.
+2. **Consumer** — units whose `autoplan.when_modified` matches a changed file (for example, a shared `_modules/...` directory).
+3. **Destroyed / moved** — units whose `terragrunt.hcl` was deleted or renamed.
+4. **Dependency closure** — the transitive `depends_on` of all of the above, in both directions.
+
+The output keeps the exact same project format (names, `when_modified`, `depends_on`, `execution_order_group`); it only contains fewer projects, which speeds up generation and keeps plans scoped to the PR:
+
+```bash
+terragrunt-atlantis-config generate \
+  --output atlantis.yaml \
+  --autoplan --parallel --create-project-name --depends-on \
+  --only-changed-files
+```
+
+Requires a git checkout (the Atlantis pod, not a bare archive). The `--filter`/`--filter-exclude` flags still apply on top.
+
+### Tune autoplan triggers
+
+Shared local modules (e.g. `_modules/...`) are inferred into every consumer's `autoplan.when_modified`, so a module-only PR autoplans each consumer. `--when-modified-exclude-paths` removes matching repo-relative globs from every project's `when_modified` (merged with the `atlantis_when_modified_exclude` Terragrunt local), keeping the full catalog while tuning only the autoplan triggers:
+
+```bash
+terragrunt-atlantis-config generate --when-modified-exclude-paths '_modules/**'
+```
+
+`depends_on` is unchanged.
 
 ## All Locals
 
@@ -158,6 +195,7 @@ Another way to customize the output is to use `locals` values in your terragrunt
 | `atlantis_skip`               | If true on a child module, that module will not appear in the output.<br>If true on a parent module, none of that parent's children will appear in the output. | bool         |
 | `extra_atlantis_dependencies` | See [Extra dependencies](https://github.com/transcend-io/terragrunt-atlantis-config#extra-dependencies)                                                        | list(string) |
 | `atlantis_project`            | Create Atlantis project for a project hcl file. Only functional with `--project-hcl-files` and `--use-project-markers` | bool         |
+| `atlantis_when_modified_exclude` | Removes matching repo-relative globs from the module's `autoplan.when_modified` (see [PR-scoped config](#pr-scoped-config)) | list(string) |
 
 ## Separate workspace for parallel plan and apply
 
