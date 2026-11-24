@@ -157,11 +157,13 @@ func matchesWhenModified(projectDir string, whenModified []string, repoRelativeF
 // ---------------------------------------------------------------------------
 
 var (
-	dependencyBlockRe = regexp.MustCompile(`dependency\s+"[^"]+"\s*\{[^}]*\}`)
-	configPathRe      = regexp.MustCompile(`config_path\s*=\s*"([^"]+)"`)
-	moduleSourceRe    = regexp.MustCompile(`source\s*=\s*"\$\{get_repo_root\(\)\}/([^"]+)"`)
-	fileExprRe        = regexp.MustCompile(`file\("([^"]+)"\)`)
-	findInParentRe    = regexp.MustCompile(`find_in_parent_folders\("([^"]+)"\)`)
+	dependencyBlockRe     = regexp.MustCompile(`dependency\s+"[^"]+"\s*\{[^}]*\}`)
+	configPathRe          = regexp.MustCompile(`config_path\s*=\s*"([^"]+)"`)
+	moduleSourceRe        = regexp.MustCompile(`source\s*=\s*"\$\{get_repo_root\(\)\}/([^"]+)"`)
+	fileExprRe            = regexp.MustCompile(`file\("([^"]+)"\)`)
+	findInParentRe        = regexp.MustCompile(`find_in_parent_folders\("([^"]+)"\)`)
+	whenModifiedExcludeRe = regexp.MustCompile(`atlantis_when_modified_exclude\s*=\s*\[([^\]]*)\]`)
+	stringLiteralRe       = regexp.MustCompile(`"([^"]+)"`)
 )
 
 // skipDirNames are directory names excluded from the Terragrunt unit walk.
@@ -314,6 +316,45 @@ func collectReverseDependents(repoRoot string, targetDirs map[string]struct{}) m
 	return consumers
 }
 
+// parseWhenModifiedExclude extracts the atlantis_when_modified_exclude globs
+// from HCL content (lightweight regex; used only for consumer discovery).
+func parseWhenModifiedExclude(content string) []string {
+	m := whenModifiedExcludeRe.FindStringSubmatch(content)
+	if m == nil {
+		return nil
+	}
+	globs := []string{}
+	for _, s := range stringLiteralRe.FindAllStringSubmatch(m[1], -1) {
+		globs = append(globs, s[1])
+	}
+	return globs
+}
+
+// findParentRootHcl returns the content of the nearest parent root.hcl above
+// the unit dir (the file find_in_parent_folders("root.hcl") resolves).
+func findParentRootHcl(repoRoot, unitDir string) (string, bool) {
+	root, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return "", false
+	}
+	root = filepath.Clean(root)
+	dir := filepath.Join(root, filepath.FromSlash(unitDir))
+	for {
+		candidate := filepath.Join(dir, "root.hcl")
+		if b, err := os.ReadFile(candidate); err == nil {
+			return string(b), true
+		}
+		if dir == root {
+			return "", false
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
 // inferWhenModified returns a lightweight approximation of a unit's
 // autoplan.when_modified, used only to discover downstream consumers.
 func inferWhenModified(repoRoot, unitDir string) []string {
@@ -400,6 +441,15 @@ func inferWhenModified(repoRoot, unitDir string) []string {
 		}
 	}
 
+	// Respect atlantis_when_modified_exclude (unit + parent root.hcl), the same
+	// way the full generator does, so shared files like root.hcl don't fan out
+	// to every unit during consumer discovery.
+	exclude := parseWhenModifiedExclude(content)
+	if rootContent, ok := findParentRootHcl(repoRoot, unitDir); ok {
+		exclude = append(exclude, parseWhenModifiedExclude(rootContent)...)
+	}
+	patterns = filterWhenModifiedExcludes(unitDir, patterns, uniqueStrings(exclude))
+
 	return uniqueStrings(patterns)
 }
 
@@ -436,9 +486,10 @@ func discoverUnitsByWhenModified(repoRoot string, changedFiles []string) map[str
 // scopedDiscovery holds the result of the discover + expand phases.
 type scopedDiscovery struct {
 	dirs         map[string]struct{}
-	changedFiles int
-	direct       int
-	consumers    int
+	changedFiles []string
+	directDirs   []string
+	consumerDirs []string
+	baseRef      string
 }
 
 // discoverAffectedUnitDirs computes the units to generate for the PR.
@@ -472,14 +523,11 @@ func discoverAffectedUnitDirs(repoRoot string) (*scopedDiscovery, error) {
 		}
 	}
 
-	directCount := len(affected)
+	directDirs := sortedKeys(affected)
 	for d := range discoverUnitsByWhenModified(repoRoot, changedFiles) {
 		affected[d] = struct{}{}
 	}
-	consumerCount := len(affected) - directCount
-	if consumerCount < 0 {
-		consumerCount = 0
-	}
+	consumerDirs := sortedKeys(difference(affected, directDirs))
 
 	closure := collectDependencyClosure(repoRoot, sortedKeys(affected))
 	for d := range collectReverseDependents(repoRoot, closure) {
@@ -488,10 +536,23 @@ func discoverAffectedUnitDirs(repoRoot string) (*scopedDiscovery, error) {
 
 	return &scopedDiscovery{
 		dirs:         closure,
-		changedFiles: len(changedFiles),
-		direct:       directCount,
-		consumers:    consumerCount,
+		changedFiles: changedFiles,
+		directDirs:   directDirs,
+		consumerDirs: consumerDirs,
+		baseRef:      ref,
 	}, nil
+}
+
+// difference returns the keys of a that are not in b.
+func difference(a map[string]struct{}, b []string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for k := range a {
+		out[k] = struct{}{}
+	}
+	for _, k := range b {
+		delete(out, k)
+	}
+	return out
 }
 
 // isAffectedUnitDir reports whether an absolute terragrunt.hcl path belongs to

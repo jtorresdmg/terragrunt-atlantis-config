@@ -1,0 +1,166 @@
+package cmd
+
+import (
+	"os"
+	"regexp"
+	"strings"
+)
+
+// ANSI color codes for the scoped report (only emitted on a TTY).
+const (
+	ansiReset   = "\033[0m"
+	ansiBold    = "\033[1m"
+	ansiDim     = "\033[2m"
+	ansiCyan    = "\033[36m"
+	ansiGreen   = "\033[32m"
+	ansiMagenta = "\033[35m"
+	ansiYellow  = "\033[33m"
+	ansiOrange  = "\033[38;5;208m"
+	ansiGray    = "\033[90m"
+)
+
+// useColor reports whether the scoped report should emit ANSI colors.
+func useColor() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	if os.Getenv("FORCE_COLOR") != "" {
+		return true
+	}
+	info, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// color wraps text in an ANSI color when colors are enabled.
+func color(text, code string) string {
+	if !useColor() {
+		return text
+	}
+	return code + text + ansiReset
+}
+
+// buildScopedReport renders the human-readable PR-scoped generation summary
+// followed by the generated atlantis.yaml (syntax-highlighted).
+func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) string {
+	var b strings.Builder
+
+	b.WriteString(color("Scoped generation: ", ansiBold))
+	b.WriteString(color("PR-scoped atlantis.yaml (discover → expand → render)", ansiCyan))
+	b.WriteString("\n\n")
+
+	// ── Discover ──
+	b.WriteString(color("▸ Discover — changes in the PR", ansiOrange+ansiBold))
+	b.WriteString("\n")
+	b.WriteString("  Changed files (" + itoa(len(d.changedFiles)) + "):\n")
+	for _, f := range d.changedFiles {
+		b.WriteString("    " + color(f, ansiGray) + "\n")
+	}
+
+	if len(d.directDirs) == 0 {
+		b.WriteString("  Direct units (0)\n    (none — no changed file lives under a unit dir)\n")
+	} else {
+		b.WriteString("  Direct units (" + itoa(len(d.directDirs)) + "):\n")
+		for _, dir := range d.directDirs {
+			b.WriteString("    " + color(dir, ansiCyan) + "\n")
+		}
+	}
+
+	if len(d.consumerDirs) == 0 {
+		b.WriteString("  Consumer units via when_modified (0)\n")
+	} else {
+		b.WriteString("  Consumer units via when_modified (" + itoa(len(d.consumerDirs)) + "):\n")
+		for _, dir := range d.consumerDirs {
+			b.WriteString("    " + color(dir, ansiCyan) + "\n")
+		}
+	}
+
+	// ── Expand ──
+	closureCount := len(d.dirs) - len(d.directDirs) - len(d.consumerDirs)
+	if closureCount < 0 {
+		closureCount = 0
+	}
+	b.WriteString("\n")
+	b.WriteString(color("▸ Expand — Terragrunt dependency graph", ansiOrange+ansiBold))
+	b.WriteString("\n")
+	b.WriteString(
+		"  Units in scope: " + itoa(len(d.dirs)) +
+			" (" + itoa(len(d.directDirs)) + " direct + " +
+			itoa(len(d.consumerDirs)) + " consumers + " +
+			itoa(closureCount) + " closure)\n",
+	)
+
+	// ── Generated YAML ──
+	b.WriteString("\n")
+	b.WriteString(color("── generated atlantis.yaml ("+itoa(projectCount)+" projects) ──", ansiBold))
+	b.WriteString("\n\n")
+	b.WriteString(highlightYaml(yamlString))
+
+	return b.String()
+}
+
+// highlightYaml applies lightweight syntax highlighting to the generated YAML.
+func highlightYaml(yaml string) string {
+	if !useColor() {
+		return yaml
+	}
+	lines := strings.Split(yaml, "\n")
+	for i, line := range lines {
+		lines[i] = highlightYamlLine(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+var (
+	yamlKeyLineRe = regexp.MustCompile(`^(\s*)(- )?([a-zA-Z_][a-zA-Z0-9_]*)(:)(.*)$`)
+	yamlStringRe  = regexp.MustCompile(`'[^']*'`)
+	yamlBoolRe    = regexp.MustCompile(`\b(true|false)\b`)
+	yamlNumberRe  = regexp.MustCompile(`\b\d+\b`)
+)
+
+func highlightYamlLine(line string) string {
+	m := yamlKeyLineRe.FindStringSubmatch(line)
+	if m == nil {
+		return highlightYamlValue(line)
+	}
+	key := m[1] + m[2] + color(m[3], ansiCyan) + m[4]
+	return key + highlightYamlValue(m[5])
+}
+
+func highlightYamlValue(value string) string {
+	value = yamlStringRe.ReplaceAllStringFunc(value, func(s string) string {
+		return color(s, ansiGreen)
+	})
+	value = yamlBoolRe.ReplaceAllStringFunc(value, func(s string) string {
+		return color(s, ansiMagenta)
+	})
+	value = yamlNumberRe.ReplaceAllStringFunc(value, func(s string) string {
+		return color(s, ansiYellow)
+	})
+	return value
+}
+
+// itoa converts an int to a string (avoids a strconv import for a few calls).
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}

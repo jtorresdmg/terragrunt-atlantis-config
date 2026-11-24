@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -158,6 +159,24 @@ func TestDiscoverUnitsByWhenModified(t *testing.T) {
 
 	consumers := discoverUnitsByWhenModified(root, []string{"_modules/foo/main.tf"})
 	assert.Contains(t, consumers, "unit")
+}
+
+func TestInferWhenModifiedRespectsExclude(t *testing.T) {
+	root := t.TempDir()
+	requireNoErr(t, os.WriteFile(filepath.Join(root, "root.hcl"), []byte(`locals {
+  atlantis_when_modified_exclude = ["root.hcl"]
+}`), 0o644))
+	writeUnit(t, root, "unit", `terraform { source = "${get_repo_root()}/_modules/foo" }
+include "root" {
+  path = find_in_parent_folders("root.hcl")
+}`)
+
+	patterns := inferWhenModified(root, "unit")
+	for _, p := range patterns {
+		if strings.HasSuffix(filepath.ToSlash(p), "root.hcl") {
+			t.Fatalf("root.hcl pattern should be excluded by atlantis_when_modified_exclude, got %q", p)
+		}
+	}
 }
 
 func requireNoErr(t *testing.T, err error) {

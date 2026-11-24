@@ -797,7 +797,7 @@ func main(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		log.Infof("Scoped generation: %d changed files -> %d units in scope", scoped.changedFiles, len(scoped.dirs))
+		log.Infof("Scoped generation: %d changed files -> %d units in scope", len(scoped.changedFiles), len(scoped.dirs))
 	}
 
 	lock := sync.Mutex{}
@@ -1006,7 +1006,8 @@ func main(cmd *cobra.Command, args []string) error {
 	}
 
 	if onlyChangedFiles {
-		log.Printf("Generated dynamic atlantis.yaml (%d projects):\n%s", len(config.Projects), yamlString)
+		os.Stderr.WriteString(buildScopedReport(scoped, yamlString, len(config.Projects)))
+		os.Stderr.WriteString("\n")
 	}
 
 	return nil
