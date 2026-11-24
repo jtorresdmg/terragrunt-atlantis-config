@@ -483,6 +483,12 @@ func discoverUnitsByWhenModified(repoRoot string, changedFiles []string) map[str
 	return matched
 }
 
+// scopedExclude is a when_modified exclusion applied during discovery.
+type scopedExclude struct {
+	glob   string
+	source string // "local" (atlantis_when_modified_exclude) or "flag" (--when-modified-exclude-paths)
+}
+
 // scopedDiscovery holds the result of the discover + expand phases.
 type scopedDiscovery struct {
 	dirs         map[string]struct{}
@@ -490,6 +496,8 @@ type scopedDiscovery struct {
 	directDirs   []string
 	consumerDirs []string
 	baseRef      string
+	dependsOn    map[string][]string // dir -> in-scope dirs it depends on
+	excludes     []scopedExclude
 }
 
 // discoverAffectedUnitDirs computes the units to generate for the PR.
@@ -534,12 +542,45 @@ func discoverAffectedUnitDirs(repoRoot string) (*scopedDiscovery, error) {
 		closure[d] = struct{}{}
 	}
 
+	dependsOn := map[string][]string{}
+	for dir := range closure {
+		for _, dep := range dependencyTargetDirs(repoRoot, dir) {
+			if _, ok := closure[dep]; ok {
+				dependsOn[dir] = append(dependsOn[dir], dep)
+			}
+		}
+		sort.Strings(dependsOn[dir])
+	}
+
+	excludeSet := map[string]string{}
+	for dir := range closure {
+		if rootContent, ok := findParentRootHcl(repoRoot, dir); ok {
+			for _, g := range parseWhenModifiedExclude(rootContent) {
+				if _, seen := excludeSet[g]; !seen {
+					excludeSet[g] = "local"
+				}
+			}
+		}
+	}
+	for _, g := range whenModifiedExcludePaths {
+		if _, seen := excludeSet[g]; !seen {
+			excludeSet[g] = "flag"
+		}
+	}
+	excludes := make([]scopedExclude, 0, len(excludeSet))
+	for g, src := range excludeSet {
+		excludes = append(excludes, scopedExclude{glob: g, source: src})
+	}
+	sort.Slice(excludes, func(i, j int) bool { return excludes[i].glob < excludes[j].glob })
+
 	return &scopedDiscovery{
 		dirs:         closure,
 		changedFiles: changedFiles,
 		directDirs:   directDirs,
 		consumerDirs: consumerDirs,
 		baseRef:      ref,
+		dependsOn:    dependsOn,
+		excludes:     excludes,
 	}, nil
 }
 

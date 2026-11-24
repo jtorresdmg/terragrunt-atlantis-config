@@ -56,7 +56,11 @@ func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) 
 	b.WriteString("\n")
 	b.WriteString("  Changed files (" + itoa(len(d.changedFiles)) + "):\n")
 	for _, f := range d.changedFiles {
-		b.WriteString("    " + color(f, ansiGray) + "\n")
+		line := "    - " + color(f, ansiGray)
+		if kind := changedFileKind(f); kind != "" {
+			line += "  " + color("["+kind+"]", ansiDim)
+		}
+		b.WriteString(line + "\n")
 	}
 
 	if len(d.directDirs) == 0 {
@@ -64,7 +68,7 @@ func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) 
 	} else {
 		b.WriteString("  Direct units (" + itoa(len(d.directDirs)) + "):\n")
 		for _, dir := range d.directDirs {
-			b.WriteString("    " + color(dir, ansiCyan) + "\n")
+			b.WriteString("    - " + color(dir, ansiCyan) + "\n")
 		}
 	}
 
@@ -73,7 +77,14 @@ func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) 
 	} else {
 		b.WriteString("  Consumer units via when_modified (" + itoa(len(d.consumerDirs)) + "):\n")
 		for _, dir := range d.consumerDirs {
-			b.WriteString("    " + color(dir, ansiCyan) + "\n")
+			b.WriteString("    - " + color(dir, ansiCyan) + "\n")
+		}
+	}
+
+	if len(d.excludes) > 0 {
+		b.WriteString("  when_modified excludes (applied):\n")
+		for _, ex := range d.excludes {
+			b.WriteString("    - " + color(ex.glob, ansiGray) + "  " + color("["+ex.source+"]", ansiDim) + "\n")
 		}
 	}
 
@@ -92,6 +103,19 @@ func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) 
 			itoa(closureCount) + " closure)\n",
 	)
 
+	b.WriteString("\n  Dependency graph (dir → depends_on):\n")
+	for _, dir := range sortedKeys(d.dirs) {
+		deps := d.dependsOn[dir]
+		if len(deps) == 0 {
+			b.WriteString("    " + color(dir, ansiCyan) + "  " + color("(no deps)", ansiDim) + "\n")
+			continue
+		}
+		b.WriteString("    " + color(dir, ansiCyan) + "\n")
+		for _, dep := range deps {
+			b.WriteString("      └─ " + color(dep, ansiGray) + "\n")
+		}
+	}
+
 	// ── Generated YAML ──
 	b.WriteString("\n")
 	b.WriteString(color("── generated atlantis.yaml ("+itoa(projectCount)+" projects) ──", ansiBold))
@@ -99,6 +123,17 @@ func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) 
 	b.WriteString(highlightYaml(yamlString))
 
 	return b.String()
+}
+
+// changedFileKind returns a short label for a changed file used in the report.
+func changedFileKind(path string) string {
+	if strings.HasPrefix(path, "_modules/") {
+		return "module"
+	}
+	if strings.HasSuffix(path, "root.hcl") {
+		return "shared"
+	}
+	return ""
 }
 
 // highlightYaml applies lightweight syntax highlighting to the generated YAML.
