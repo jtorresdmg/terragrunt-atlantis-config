@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Parse env vars into a map
@@ -751,6 +752,7 @@ func getAllTerragruntProjectHclFiles() map[string][]string {
 }
 
 func main(cmd *cobra.Command, args []string) error {
+	startTime := time.Now()
 	// Ensure the gitRoot has a trailing slash and is an absolute path
 	absoluteGitRoot, err := filepath.Abs(gitRoot)
 	if err != nil {
@@ -1006,7 +1008,7 @@ func main(cmd *cobra.Command, args []string) error {
 	}
 
 	if onlyChangedFiles {
-		os.Stderr.WriteString(buildScopedReport(scoped, yamlString, len(config.Projects)))
+		os.Stderr.WriteString(buildScopedReport(scoped, yamlString, len(config.Projects), time.Since(startTime)))
 		os.Stderr.WriteString("\n")
 	}
 

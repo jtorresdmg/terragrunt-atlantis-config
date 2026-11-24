@@ -4,6 +4,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // ANSI color codes for the scoped report (only emitted on a TTY).
@@ -44,7 +45,7 @@ func color(text, code string) string {
 
 // buildScopedReport renders the human-readable PR-scoped generation summary
 // followed by the generated atlantis.yaml (syntax-highlighted).
-func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) string {
+func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int, elapsed time.Duration) string {
 	var b strings.Builder
 
 	b.WriteString(color("Scoped generation: ", ansiBold))
@@ -137,6 +138,11 @@ func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) 
 	b.WriteString(color("── generated atlantis.yaml ("+itoa(projectCount)+" projects) ──", ansiBold))
 	b.WriteString("\n\n")
 	b.WriteString(highlightYaml(yamlString))
+
+	// ── Elapsed ──
+	b.WriteString("\n")
+	b.WriteString(color("⏱ Elapsed: "+elapsed.Round(time.Millisecond).String(), ansiBold))
+	b.WriteString("\n")
 
 	return b.String()
 }
