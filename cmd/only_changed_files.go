@@ -164,6 +164,7 @@ var (
 	findInParentRe        = regexp.MustCompile(`find_in_parent_folders\("([^"]+)"\)`)
 	whenModifiedExcludeRe = regexp.MustCompile(`atlantis_when_modified_exclude\s*=\s*\[([^\]]*)\]`)
 	stringLiteralRe       = regexp.MustCompile(`"([^"]+)"`)
+	localRefRe            = regexp.MustCompile(`local\.[a-zA-Z_][a-zA-Z0-9_]*`)
 )
 
 // skipDirNames are directory names excluded from the Terragrunt unit walk.
@@ -330,6 +331,44 @@ func parseWhenModifiedExclude(content string) []string {
 	return globs
 }
 
+// scopedExtraDep is an entry of extra_atlantis_dependencies.
+type scopedExtraDep struct {
+	value string
+	kind  string // "literal", "negation" or "dynamic"
+}
+
+// parseExtraAtlantisDependencies extracts the extra_atlantis_dependencies
+// entries (literal strings, negations and dynamic references) from HCL content.
+// Literals are used for discovery; dynamic references (local.*, concat, …) are
+// reported but not resolved here.
+func parseExtraAtlantisDependencies(content string) []scopedExtraDep {
+	idx := strings.Index(content, "extra_atlantis_dependencies")
+	if idx == -1 {
+		return nil
+	}
+	window := content[idx:]
+	if len(window) > 600 {
+		window = window[:600]
+	}
+	if end := strings.Index(window, "\n}"); end != -1 {
+		window = window[:end]
+	}
+
+	deps := []scopedExtraDep{}
+	for _, m := range stringLiteralRe.FindAllStringSubmatch(window, -1) {
+		val := m[1]
+		kind := "literal"
+		if strings.HasPrefix(val, "!") {
+			kind = "negation"
+		}
+		deps = append(deps, scopedExtraDep{value: val, kind: kind})
+	}
+	for _, m := range localRefRe.FindAllStringSubmatch(window, -1) {
+		deps = append(deps, scopedExtraDep{value: m[0], kind: "dynamic"})
+	}
+	return deps
+}
+
 // findParentRootHcl returns the content of the nearest parent root.hcl above
 // the unit dir (the file find_in_parent_folders("root.hcl") resolves).
 func findParentRootHcl(repoRoot, unitDir string) (string, bool) {
@@ -441,11 +480,24 @@ func inferWhenModified(repoRoot, unitDir string) []string {
 		}
 	}
 
+	// extra_atlantis_dependencies: add literal entries to when_modified so a
+	// change to those files triggers the unit during consumer discovery.
+	extraDeps := parseExtraAtlantisDependencies(content)
+	rootContent, hasRoot := findParentRootHcl(repoRoot, unitDir)
+	if hasRoot {
+		extraDeps = append(extraDeps, parseExtraAtlantisDependencies(rootContent)...)
+	}
+	for _, dep := range extraDeps {
+		if dep.kind == "literal" {
+			patterns = append(patterns, dep.value)
+		}
+	}
+
 	// Respect atlantis_when_modified_exclude (unit + parent root.hcl), the same
 	// way the full generator does, so shared files like root.hcl don't fan out
 	// to every unit during consumer discovery.
 	exclude := parseWhenModifiedExclude(content)
-	if rootContent, ok := findParentRootHcl(repoRoot, unitDir); ok {
+	if hasRoot {
 		exclude = append(exclude, parseWhenModifiedExclude(rootContent)...)
 	}
 	patterns = filterWhenModifiedExcludes(unitDir, patterns, uniqueStrings(exclude))
@@ -498,6 +550,7 @@ type scopedDiscovery struct {
 	baseRef      string
 	dependsOn    map[string][]string // dir -> in-scope dirs it depends on
 	excludes     []scopedExclude
+	extraDeps    []scopedExtraDep
 }
 
 // discoverAffectedUnitDirs computes the units to generate for the PR.
@@ -573,6 +626,29 @@ func discoverAffectedUnitDirs(repoRoot string) (*scopedDiscovery, error) {
 	}
 	sort.Slice(excludes, func(i, j int) bool { return excludes[i].glob < excludes[j].glob })
 
+	extraDepSet := map[string]string{}
+	for dir := range closure {
+		if rootContent, ok := findParentRootHcl(repoRoot, dir); ok {
+			for _, dep := range parseExtraAtlantisDependencies(rootContent) {
+				if _, seen := extraDepSet[dep.value]; !seen {
+					extraDepSet[dep.value] = dep.kind
+				}
+			}
+		}
+		if unitContent, ok := readUnitContent(repoRoot, dir); ok {
+			for _, dep := range parseExtraAtlantisDependencies(unitContent) {
+				if _, seen := extraDepSet[dep.value]; !seen {
+					extraDepSet[dep.value] = dep.kind
+				}
+			}
+		}
+	}
+	extraDeps := make([]scopedExtraDep, 0, len(extraDepSet))
+	for val, kind := range extraDepSet {
+		extraDeps = append(extraDeps, scopedExtraDep{value: val, kind: kind})
+	}
+	sort.Slice(extraDeps, func(i, j int) bool { return extraDeps[i].value < extraDeps[j].value })
+
 	return &scopedDiscovery{
 		dirs:         closure,
 		changedFiles: changedFiles,
@@ -581,6 +657,7 @@ func discoverAffectedUnitDirs(repoRoot string) (*scopedDiscovery, error) {
 		baseRef:      ref,
 		dependsOn:    dependsOn,
 		excludes:     excludes,
+		extraDeps:    extraDeps,
 	}, nil
 }
 

@@ -88,6 +88,22 @@ func buildScopedReport(d *scopedDiscovery, yamlString string, projectCount int) 
 		}
 	}
 
+	if len(d.extraDeps) == 0 {
+		b.WriteString("  extra_atlantis_dependencies: (not declared)\n")
+	} else {
+		b.WriteString("  extra_atlantis_dependencies:\n")
+		for _, dep := range d.extraDeps {
+			label := "literal"
+			switch dep.kind {
+			case "negation":
+				label = "literal · negation"
+			case "dynamic":
+				label = "dynamic · not resolved"
+			}
+			b.WriteString("    - " + color(dep.value, ansiGray) + "  " + color("["+label+"]", ansiDim) + "\n")
+		}
+	}
+
 	// ── Expand ──
 	closureCount := len(d.dirs) - len(d.directDirs) - len(d.consumerDirs)
 	if closureCount < 0 {

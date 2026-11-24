@@ -179,6 +179,26 @@ include "root" {
 	}
 }
 
+func TestParseExtraAtlantisDependencies(t *testing.T) {
+	content := `locals {
+  extra_atlantis_dependencies = concat([
+    local.global_config_path,
+    "**/*.json",
+    "!.atlantis-lifecycle.yaml",
+  ], [])
+}`
+	deps := parseExtraAtlantisDependencies(content)
+	assert.Equal(t, []scopedExtraDep{
+		{value: "**/*.json", kind: "literal"},
+		{value: "!.atlantis-lifecycle.yaml", kind: "negation"},
+		{value: "local.global_config_path", kind: "dynamic"},
+	}, deps)
+}
+
+func TestParseExtraAtlantisDependenciesNotDeclared(t *testing.T) {
+	assert.Nil(t, parseExtraAtlantisDependencies(`locals { foo = "bar" }`))
+}
+
 func requireNoErr(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
