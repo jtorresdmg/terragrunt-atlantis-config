@@ -175,25 +175,63 @@ var skipDirNames = map[string]bool{
 	"node_modules":      true,
 }
 
-// stripHclLineComments removes HCL `#` line comments (outside double quotes).
-func stripHclLineComments(content string) string {
-	lines := strings.Split(content, "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		inString := false
-		for i := 0; i < len(line); i++ {
-			c := line[i]
-			if c == '"' && (i == 0 || line[i-1] != '\\') {
-				inString = !inString
+// stripHclComments removes HCL comments — `#` and `//` line comments and
+// `/* ... */` block comments — outside double-quoted strings. It is used only
+// for lightweight discovery, so it approximates HCL lexing without a full parse.
+func stripHclComments(content string) string {
+	var b strings.Builder
+	b.Grow(len(content))
+
+	inString := false
+	inBlock := false
+
+	for i := 0; i < len(content); i++ {
+		c := content[i]
+
+		if inBlock {
+			if c == '*' && i+1 < len(content) && content[i+1] == '/' {
+				inBlock = false
+				i++
 			}
-			if !inString && c == '#' {
-				line = line[:i]
-				break
-			}
+			continue
 		}
-		out = append(out, line)
+
+		if inString {
+			b.WriteByte(c)
+			if c == '"' && (i == 0 || content[i-1] != '\\') {
+				inString = false
+			}
+			continue
+		}
+
+		switch {
+		case c == '"':
+			inString = true
+			b.WriteByte(c)
+		case c == '#':
+			// Line comment: skip to the end of the line, preserving the newline.
+			for i < len(content) && content[i] != '\n' {
+				i++
+			}
+			if i < len(content) {
+				b.WriteByte('\n')
+			}
+		case c == '/' && i+1 < len(content) && content[i+1] == '/':
+			for i < len(content) && content[i] != '\n' {
+				i++
+			}
+			if i < len(content) {
+				b.WriteByte('\n')
+			}
+		case c == '/' && i+1 < len(content) && content[i+1] == '*':
+			inBlock = true
+			i++
+		default:
+			b.WriteByte(c)
+		}
 	}
-	return strings.Join(out, "\n")
+
+	return b.String()
 }
 
 // readUnitContent returns the terragrunt.hcl content of a unit dir.
@@ -258,7 +296,7 @@ func dependencyTargetDirs(repoRoot, unitDir string) []string {
 	if !ok {
 		return nil
 	}
-	stripped := stripHclLineComments(content)
+	stripped := stripHclComments(content)
 	targets := map[string]struct{}{}
 	for _, block := range dependencyBlockRe.FindAllString(stripped, -1) {
 		m := configPathRe.FindStringSubmatch(block)
@@ -320,7 +358,7 @@ func collectReverseDependents(repoRoot string, targetDirs map[string]struct{}) m
 // parseWhenModifiedExclude extracts the atlantis_when_modified_exclude globs
 // from HCL content (lightweight regex; used only for consumer discovery).
 func parseWhenModifiedExclude(content string) []string {
-	m := whenModifiedExcludeRe.FindStringSubmatch(content)
+	m := whenModifiedExcludeRe.FindStringSubmatch(stripHclComments(content))
 	if m == nil {
 		return nil
 	}
@@ -342,6 +380,7 @@ type scopedExtraDep struct {
 // Literals are used for discovery; dynamic references (local.*, concat, …) are
 // reported but not resolved here.
 func parseExtraAtlantisDependencies(content string) []scopedExtraDep {
+	content = stripHclComments(content)
 	idx := strings.Index(content, "extra_atlantis_dependencies")
 	if idx == -1 {
 		return nil
@@ -401,7 +440,7 @@ func inferWhenModified(repoRoot, unitDir string) []string {
 	if !ok {
 		return []string{"*.hcl", "*.tf*"}
 	}
-	stripped := stripHclLineComments(content)
+	stripped := stripHclComments(content)
 	root, _ := filepath.Abs(repoRoot)
 	root = filepath.Clean(root)
 	unitAbs := filepath.Join(root, filepath.FromSlash(unitDir))
@@ -469,7 +508,7 @@ func inferWhenModified(repoRoot, unitDir string) []string {
 			patterns = append(patterns, relDir+"/terragrunt.hcl")
 		}
 		if depContent, ok := readUnitContent(repoRoot, depDir); ok {
-			for _, m := range moduleSourceRe.FindAllStringSubmatch(stripHclLineComments(depContent), -1) {
+			for _, m := range moduleSourceRe.FindAllStringSubmatch(stripHclComments(depContent), -1) {
 				depModuleRel := strings.Trim(m[1], "/")
 				depModuleAbs := filepath.Join(root, filepath.FromSlash(depModuleRel))
 				if info, err := os.Stat(depModuleAbs); err == nil && info.IsDir() {

@@ -199,6 +199,57 @@ func TestParseExtraAtlantisDependenciesNotDeclared(t *testing.T) {
 	assert.Nil(t, parseExtraAtlantisDependencies(`locals { foo = "bar" }`))
 }
 
+func TestStripHclComments(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"hash line comment", "a = 1 # comment\nb = 2\n", "a = 1 \nb = 2\n"},
+		{"slash line comment", "a = 1 // comment\nb = 2\n", "a = 1 \nb = 2\n"},
+		{"block comment", "a /* x */ b\n", "a  b\n"},
+		{"block comment multi-line", "a /* x\ny */ b\n", "a  b\n"},
+		{"hash in string kept", "a = \"# not comment\"\n", "a = \"# not comment\"\n"},
+		{"block in string kept", "a = \"/* not comment */\"\n", "a = \"/* not comment */\"\n"},
+		{"no comments unchanged", "locals {\n  a = \"b\"\n}\n", "locals {\n  a = \"b\"\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, stripHclComments(tt.in))
+		})
+	}
+}
+
+func TestParseWhenModifiedExcludeIgnoresComments(t *testing.T) {
+	content := `locals {
+  atlantis_when_modified_exclude = [
+    "_modules/github/managed-repos/**",
+    # "github/root.hcl",
+    // "github/other.hcl",
+    /* "github/block.hcl", */
+  ]
+}`
+	assert.Equal(t,
+		[]string{"_modules/github/managed-repos/**"},
+		parseWhenModifiedExclude(content),
+	)
+}
+
+func TestParseExtraAtlantisDependenciesIgnoresComments(t *testing.T) {
+	content := `locals {
+  extra_atlantis_dependencies = [
+    "**/*.json",
+    # "!.atlantis-lifecycle.yaml",
+    "!ignored.json",
+  ]
+}`
+	deps := parseExtraAtlantisDependencies(content)
+	assert.Equal(t, []scopedExtraDep{
+		{value: "**/*.json", kind: "literal"},
+		{value: "!ignored.json", kind: "negation"},
+	}, deps)
+}
+
 func requireNoErr(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
