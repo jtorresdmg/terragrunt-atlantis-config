@@ -82,8 +82,10 @@ func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, elapsed time.
 		}
 	}
 
-	if len(d.excludes) > 0 {
-		b.WriteString("  when_modified excludes (applied):\n")
+	if len(d.excludes) == 0 {
+		b.WriteString("  atlantis_when_modified_exclude: (not declared)\n")
+	} else {
+		b.WriteString("  atlantis_when_modified_exclude (applied):\n")
 		for _, ex := range d.excludes {
 			b.WriteString("    - " + color(ex.glob, ansiGray) + "  " + color("["+ex.source+"]", ansiDim) + "\n")
 		}
