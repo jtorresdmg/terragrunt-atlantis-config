@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -751,6 +752,31 @@ func getAllTerragruntProjectHclFiles() map[string][]string {
 	return uniqueHclFileAbsPaths
 }
 
+// logProject records a per-project creation/update event. When the scoped
+// generation covers more than maxListedDirs units, the human-readable report
+// already summarizes them, so these are downgraded to debug to avoid flooding
+// the log with one line per project.
+func logProject(msg, path string) {
+	if suppressProjectLogs {
+		log.Debug(msg, path)
+		return
+	}
+	log.Info(msg, path)
+}
+
+// logGenerationProgress reports generation progress periodically (every 100
+// projects and on the last one) so the log doesn't look frozen while a large
+// scope is being processed. It is a no-op unless a total is known.
+func logGenerationProgress() {
+	if generationTotal <= 0 {
+		return
+	}
+	done := atomic.AddInt64(&generationProgress, 1)
+	if done%100 == 0 || done >= generationTotal {
+		log.Infof("Generating: %d/%d projects", done, generationTotal)
+	}
+}
+
 func main(cmd *cobra.Command, args []string) error {
 	startTime := time.Now()
 	// Ensure the gitRoot has a trailing slash and is an absolute path
@@ -798,12 +824,19 @@ func main(cmd *cobra.Command, args []string) error {
 	}
 
 	var scoped *scopedDiscovery
+	suppressProjectLogs = false
+	generationProgress = 0
+	generationTotal = 0
 	if onlyChangedFiles {
 		scoped, err = discoverAffectedUnitDirs(gitRoot)
 		if err != nil {
 			return err
 		}
 		log.Infof("Scoped generation: %d changed files -> %d units in scope", len(scoped.changedFiles), len(scoped.dirs))
+		suppressProjectLogs = len(scoped.dirs) > maxListedDirs
+		if suppressProjectLogs {
+			generationTotal = int64(len(scoped.dirs))
+		}
 	}
 
 	lock := sync.Mutex{}
@@ -867,7 +900,7 @@ func main(cmd *cobra.Command, args []string) error {
 						for i := range config.Projects {
 							if config.Projects[i].Dir == project.Dir {
 								updateProject = true
-								log.Info("Updated project for ", terragruntPath)
+								logProject("Updated project for ", terragruntPath)
 								config.Projects[i] = *project
 
 								// projects should be unique, let's exit for loop for performance
@@ -877,12 +910,14 @@ func main(cmd *cobra.Command, args []string) error {
 						}
 
 						if !updateProject {
-							log.Info("Created project for ", terragruntPath)
+							logProject("Created project for ", terragruntPath)
 							config.Projects = append(config.Projects, *project)
+							logGenerationProgress()
 						}
 					} else {
-						log.Info("Created project for ", terragruntPath)
+						logProject("Created project for ", terragruntPath)
 						config.Projects = append(config.Projects, *project)
+						logGenerationProgress()
 					}
 
 					return nil
@@ -914,7 +949,7 @@ func main(cmd *cobra.Command, args []string) error {
 				lock.Lock()
 				defer lock.Unlock()
 
-				log.Info("Created "+projectHcl+" project for ", workingDir)
+				logProject("Created "+projectHcl+" project for ", workingDir)
 				config.Projects = append(config.Projects, *project)
 
 				return nil
@@ -1006,14 +1041,30 @@ func main(cmd *cobra.Command, args []string) error {
 
 	// Write output
 	if len(outputPath) != 0 {
-		os.WriteFile(outputPath, []byte(yamlString), 0644)
+		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+			log.Warnf("Could not create directory for %s: %v", outputPath, err)
+		} else if err := os.WriteFile(outputPath, []byte(yamlString), 0644); err != nil {
+			log.Warnf("Could not write %s: %v", outputPath, err)
+		}
 	} else {
 		log.Println(yamlString)
 	}
 
 	if onlyChangedFiles {
-		os.Stderr.WriteString(buildScopedReport(scoped, &config, tgVersions, time.Since(startTime)))
+		elapsed := time.Since(startTime)
+		if suppressProjectLogs {
+			log.Warnf("%d projects in scope — per-project log omitted (limit: %d); full report: %s", len(scoped.dirs), maxListedDirs, reportFileName)
+		}
+		// Truncated report to stderr (short terminal log).
+		os.Stderr.WriteString(buildScopedReport(scoped, &config, tgVersions, elapsed, false))
 		os.Stderr.WriteString("\n")
+		// Full report to a file next to atlantis.yaml, for download.
+		fullReport := buildScopedReport(scoped, &config, tgVersions, elapsed, true)
+		if err := os.MkdirAll(filepath.Dir(reportPath()), 0755); err != nil {
+			log.Warnf("Could not create directory for report %s: %v", reportPath(), err)
+		} else if err := os.WriteFile(reportPath(), []byte(fullReport), 0644); err != nil {
+			log.Warnf("Could not write full report to %s: %v", reportPath(), err)
+		}
 	}
 
 	return nil
@@ -1047,6 +1098,9 @@ var executionOrderGroups bool
 var dependsOn bool
 var onlyChangedFiles bool
 var baseRef string
+var suppressProjectLogs bool
+var generationProgress int64
+var generationTotal int64
 
 // generateCmd represents the generate command
 var generateCmd = &cobra.Command{

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -50,6 +51,14 @@ func displayWidth(s string) int {
 	return utf8.RuneCountInString(s)
 }
 
+// padRight pads s with spaces until it occupies the given display width.
+func padRight(s string, width int) string {
+	if w := displayWidth(s); w < width {
+		return s + strings.Repeat(" ", width-w)
+	}
+	return s
+}
+
 // dividerLine returns a line of box-drawing dashes of the given width.
 func dividerLine(width int) string {
 	return strings.Repeat("─", width)
@@ -66,9 +75,88 @@ func dividerLabel(label string, width int) string {
 	return strings.Repeat("─", left) + label + strings.Repeat("─", right)
 }
 
+// maxRenderedProjects is the maximum number of projects whose YAML is dumped
+// into the report. Above this the full YAML is omitted and a download command
+// is shown instead.
+const maxRenderedProjects = 50
+
+// maxListedDirs is the maximum number of directory entries rendered in a
+// single list (consumer units / dependency graph) before they are collapsed
+// into prefix groups.
+const maxListedDirs = 50
+
+// serviceAccountNamespace returns the Kubernetes namespace this process runs
+// in (empty when not running inside a pod).
+func serviceAccountNamespace() string {
+	b, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// inPod reports whether this process runs inside a Kubernetes pod, in which
+// case a kubectl exec download command makes sense.
+func inPod() bool {
+	return strings.TrimSpace(os.Getenv("HOSTNAME")) != "" && serviceAccountNamespace() != ""
+}
+
+// reportFileName is the file the full (untruncated) scoped report is written to.
+const reportFileName = "tac_report.log"
+
+// reportPath returns the path (relative to the working directory) where the
+// full report is written, next to the generated atlantis.yaml.
+func reportPath() string {
+	if outputPath != "" {
+		return filepath.Join(filepath.Dir(outputPath), reportFileName)
+	}
+	return reportFileName
+}
+
+// atlantisConfigPath returns the path of the generated atlantis.yaml (the
+// --output path, defaulting to "atlantis.yaml").
+func atlantisConfigPath() string {
+	if outputPath != "" {
+		return outputPath
+	}
+	return "atlantis.yaml"
+}
+
+// downloadCommand builds the kubectl command an operator can run (with VPN +
+// kubeconfig access) to fetch a file from this pod.
+func downloadCommand(filename string) string {
+	pod := strings.TrimSpace(os.Getenv("HOSTNAME"))
+	namespace := serviceAccountNamespace()
+	path := filename
+	if cwd, err := os.Getwd(); err == nil {
+		path = filepath.Join(cwd, filename)
+	}
+	if pod == "" || namespace == "" {
+		// Not running inside a pod; point at the local file instead.
+		return "cat " + path
+	}
+	return "kubectl -n " + namespace + " exec " + pod + " -- cat " + path
+}
+
+// allNoDeps reports whether every directory at or under prefix has no
+// depends_on entries (used to annotate collapsed dependency-graph groups).
+func allNoDeps(prefix string, dirs map[string]struct{}, dependsOn map[string][]string) bool {
+	for dir := range dirs {
+		if dir == prefix || strings.HasPrefix(dir, prefix+"/") {
+			if len(dependsOn[dir]) > 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // buildScopedReport renders the human-readable PR-scoped generation summary
-// followed by the generated atlantis.yaml (syntax-highlighted).
-func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, tgVersions terragruntVersionInfo, elapsed time.Duration) string {
+// followed by the generated atlantis.yaml (syntax-highlighted). When full is
+// true no list is collapsed and the full YAML is included (used for the
+// tac_report.log file); otherwise long lists are grouped and the YAML omitted
+// to keep the terminal log short.
+func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, tgVersions terragruntVersionInfo, elapsed time.Duration, full bool) string {
 	var b strings.Builder
 
 	title := "Scoped generation: PR-scoped atlantis.yaml (discover → expand → render)"
@@ -95,7 +183,7 @@ func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, tgVersions te
 	b.WriteString("  - Runtime:     " + color(system, ansiCyan) + "\n")
 	switch {
 	case tgVersions.mismatch():
-		b.WriteString("  " + color("⚠ mismatch — runtime "+system+" is in a different 0.X family than TAC's "+embedded+"; consider aligning them", ansiYellow) + "\n")
+		b.WriteString("  " + color("⚠️ mismatch — runtime "+system+" is in a different 0.X family than TAC's "+embedded+"; consider aligning them", ansiYellow) + "\n")
 	case tgVersions.embeddedOK && tgVersions.systemOK:
 		b.WriteString("  " + color("✓ same 0.X family", ansiGreen) + "\n")
 	}
@@ -127,8 +215,16 @@ func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, tgVersions te
 		b.WriteString("  Consumer units via when_modified (0)\n")
 	} else {
 		b.WriteString("  Consumer units via when_modified (" + itoa(len(d.consumerDirs)) + "):\n")
-		for _, dir := range d.consumerDirs {
-			b.WriteString("    - " + color(dir, ansiCyan) + "\n")
+		consumerLimit := maxListedDirs
+		if full {
+			consumerLimit = len(d.consumerDirs)
+		}
+		for _, e := range collapseDirs(d.consumerDirs, consumerLimit) {
+			if e.grouped {
+				b.WriteString("    - " + color(e.prefix+"/*", ansiCyan) + color("  ("+itoa(e.count)+" units)", ansiDim) + "\n")
+			} else {
+				b.WriteString("    - " + color(e.prefix, ansiCyan) + "\n")
+			}
 		}
 	}
 
@@ -173,7 +269,20 @@ func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, tgVersions te
 	)
 
 	b.WriteString("\n  Dependency graph (dir → depends_on):\n")
-	for _, dir := range sortedKeys(d.dirs) {
+	graphLimit := maxListedDirs
+	if full {
+		graphLimit = len(d.dirs)
+	}
+	for _, e := range collapseDirs(sortedKeys(d.dirs), graphLimit) {
+		if e.grouped {
+			suffix := "  (" + itoa(e.count) + " units)"
+			if allNoDeps(e.prefix, d.dirs, d.dependsOn) {
+				suffix = "  (no deps, " + itoa(e.count) + " units)"
+			}
+			b.WriteString("    " + color(e.prefix+"/*", ansiCyan) + color(suffix, ansiDim) + "\n")
+			continue
+		}
+		dir := e.prefix
 		deps := d.dependsOn[dir]
 		if len(deps) == 0 {
 			b.WriteString("    " + color(dir, ansiCyan) + "  " + color("(no deps)", ansiDim) + "\n")
@@ -189,13 +298,38 @@ func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, tgVersions te
 	b.WriteString("\n")
 	b.WriteString(color(dividerLabel("generated atlantis.yaml ("+itoa(len(config.Projects))+" projects)", reportWidth), ansiBold))
 	b.WriteString("\n\n")
-	b.WriteString(highlightYaml(renderReportYaml(config)))
+	if !full && len(config.Projects) > maxRenderedProjects {
+		b.WriteString(color("⚠️ "+itoa(len(config.Projects))+" projects generated — atlantis.yaml omitted from the log (limit: "+itoa(maxRenderedProjects)+").", ansiYellow))
+		b.WriteString("\n")
+		b.WriteString(color("   Download the full atlantis.yaml with the commands in the Summary below.", ansiDim))
+		b.WriteString("\n")
+	} else {
+		b.WriteString(highlightYaml(renderReportYaml(config)))
+	}
 
-	// ── Elapsed ──
+	// ── Summary ──
 	b.WriteString("\n")
-	b.WriteString(color("⏱ Elapsed: ", ansiBold+ansiCyan))
-	b.WriteString(color(elapsed.Round(time.Millisecond).String(), ansiMagenta))
+	b.WriteString(color(dividerLabel("Summary", reportWidth), ansiBold))
 	b.WriteString("\n")
+	b.WriteString("  " + color("📦 Projects generated: ", ansiBold) + color(itoa(len(config.Projects)), ansiCyan) + "\n")
+	b.WriteString("  " + color("🎯 Units in scope: ", ansiBold) + color(itoa(len(d.directDirs))+" direct + "+itoa(len(d.consumerDirs))+" consumers + "+itoa(closureCount)+" closure", ansiCyan) + "\n")
+	b.WriteString("  " + color("⏱ Elapsed: ", ansiBold) + color(elapsed.Round(time.Millisecond).String(), ansiMagenta) + "\n")
+	b.WriteString("\n")
+	if inPod() {
+		b.WriteString("  Download (requires VPN + kubectl):\n")
+		reportCmd := downloadCommand(reportPath())
+		yamlCmd := downloadCommand(atlantisConfigPath())
+		cmdWidth := displayWidth(reportCmd)
+		if w := displayWidth(yamlCmd); w > cmdWidth {
+			cmdWidth = w
+		}
+		b.WriteString("      " + color(padRight(reportCmd, cmdWidth), ansiCyan) + "  # full report (" + reportFileName + ")\n")
+		b.WriteString("      " + color(padRight(yamlCmd, cmdWidth), ansiCyan) + "  # atlantis.yaml\n")
+	} else {
+		b.WriteString("  Files written to:\n")
+		b.WriteString("      " + color(reportPath(), ansiCyan) + "  # full report (" + reportFileName + ")\n")
+		b.WriteString("      " + color(atlantisConfigPath(), ansiCyan) + "  # atlantis.yaml\n")
+	}
 
 	return b.String()
 }
