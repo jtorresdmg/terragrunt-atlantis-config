@@ -759,6 +759,10 @@ func main(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	gitRoot = absoluteGitRoot + string(filepath.Separator)
+
+	tgVersions := detectTerragruntVersions()
+	logTerragruntVersions(tgVersions)
+
 	workingDirs := []string{gitRoot}
 	projectHclDirMap := map[string][]string{}
 	var projectHclDirs []string
@@ -1008,7 +1012,7 @@ func main(cmd *cobra.Command, args []string) error {
 	}
 
 	if onlyChangedFiles {
-		os.Stderr.WriteString(buildScopedReport(scoped, &config, time.Since(startTime)))
+		os.Stderr.WriteString(buildScopedReport(scoped, &config, tgVersions, time.Since(startTime)))
 		os.Stderr.WriteString("\n")
 	}
 

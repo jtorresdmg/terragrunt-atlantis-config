@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ANSI color codes for the scoped report (only emitted on a TTY).
@@ -43,14 +44,63 @@ func color(text, code string) string {
 	return code + text + ansiReset
 }
 
+// displayWidth returns the number of terminal columns a string occupies
+// (each rune is one column for the characters used in the report).
+func displayWidth(s string) int {
+	return utf8.RuneCountInString(s)
+}
+
+// dividerLine returns a line of box-drawing dashes of the given width.
+func dividerLine(width int) string {
+	return strings.Repeat("─", width)
+}
+
+// dividerLabel centers a label between box-drawing dashes to the given width.
+func dividerLabel(label string, width int) string {
+	label = " " + label + " "
+	if displayWidth(label) >= width {
+		return strings.Repeat("─", width)
+	}
+	left := (width - displayWidth(label)) / 2
+	right := width - displayWidth(label) - left
+	return strings.Repeat("─", left) + label + strings.Repeat("─", right)
+}
+
 // buildScopedReport renders the human-readable PR-scoped generation summary
 // followed by the generated atlantis.yaml (syntax-highlighted).
-func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, elapsed time.Duration) string {
+func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, tgVersions terragruntVersionInfo, elapsed time.Duration) string {
 	var b strings.Builder
 
+	title := "Scoped generation: PR-scoped atlantis.yaml (discover → expand → render)"
+	reportWidth := displayWidth(title)
+
+	b.WriteString(color(dividerLine(reportWidth), ansiDim))
+	b.WriteString("\n")
 	b.WriteString(color("Scoped generation: ", ansiBold))
 	b.WriteString(color("PR-scoped atlantis.yaml (discover → expand → render)", ansiCyan))
 	b.WriteString("\n\n")
+
+	// ── Terragrunt versions ──
+	b.WriteString(color("Terragrunt versions", ansiCyan+ansiBold))
+	b.WriteString("\n")
+	embedded := tgVersions.embedded
+	if !tgVersions.embeddedOK {
+		embedded = "unknown"
+	}
+	system := tgVersions.system
+	if !tgVersions.systemOK {
+		system = "not found"
+	}
+	b.WriteString("  - TAC (build): " + color(embedded, ansiCyan) + "\n")
+	b.WriteString("  - Runtime:     " + color(system, ansiCyan) + "\n")
+	switch {
+	case tgVersions.mismatch():
+		b.WriteString("  " + color("⚠ mismatch — runtime "+system+" is in a different 0.X family than TAC's "+embedded+"; consider aligning them", ansiYellow) + "\n")
+	case tgVersions.embeddedOK && tgVersions.systemOK:
+		b.WriteString("  " + color("✓ same 0.X family", ansiGreen) + "\n")
+	}
+
+	b.WriteString("\n")
 
 	// ── Discover ──
 	b.WriteString(color("▸ Discover — changes in the PR", ansiOrange+ansiBold))
@@ -137,13 +187,14 @@ func buildScopedReport(d *scopedDiscovery, config *AtlantisConfig, elapsed time.
 
 	// ── Generated YAML ──
 	b.WriteString("\n")
-	b.WriteString(color("── generated atlantis.yaml ("+itoa(len(config.Projects))+" projects) ──", ansiBold))
+	b.WriteString(color(dividerLabel("generated atlantis.yaml ("+itoa(len(config.Projects))+" projects)", reportWidth), ansiBold))
 	b.WriteString("\n\n")
 	b.WriteString(highlightYaml(renderReportYaml(config)))
 
 	// ── Elapsed ──
 	b.WriteString("\n")
-	b.WriteString(color("⏱ Elapsed: "+elapsed.Round(time.Millisecond).String(), ansiBold))
+	b.WriteString(color("⏱ Elapsed: ", ansiBold+ansiCyan))
+	b.WriteString(color(elapsed.Round(time.Millisecond).String(), ansiMagenta))
 	b.WriteString("\n")
 
 	return b.String()
